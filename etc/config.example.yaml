@@ -93,8 +93,10 @@ points:
     scale: 0.01
     # Confirmed — matched the app's live drift (60.01Hz -> 59.99Hz) between
     # reads, AND confirmed as the real "on grid" signal by a live
-    # breaker-off test (2026-09-28): dropped to 0.00 with the main breaker
-    # open. This is what grid_status in poller.py keys on now.
+    # breaker-off test: dropped to 0.00 with the inverter's own breaker
+    # open (not the building's main breaker — see grid_voltage's note
+    # below for the panel layout this test relies on). This is what
+    # grid_status in poller.py keys on now.
 
   - name: grid_voltage
     fc: 3
@@ -102,11 +104,17 @@ points:
     datatype: u16
     scale: 0.1
     # Confirmed exact match to the app's Grid Voltage L2 (123.70V) — but a
-    # live breaker-off test (2026-09-28) showed this stays present even
-    # with the main breaker open, so it's almost certainly reading
-    # downstream of the inverter's own EPS/output side, not the actual
-    # utility feed. Kept as telemetry (still real data) but NOT used for
-    # grid-loss detection — grid_frequency_hz is, see above.
+    # live breaker-off test showed this stays present (~120V) even with
+    # the inverter's own breaker open. That's expected, not a mapping
+    # error: this inverter senses grid voltage via CT sensors at the
+    # service entry, upstream of the inverter's breaker/sub-panel in the
+    # panel chain (inverter <-> inverter breaker/sub-panel <-> main
+    # building panel/breaker <-> utility grid), so opening only the
+    # inverter's breaker doesn't remove what the CTs see — the utility
+    # feed to the main panel is still live. Kept as telemetry (still real
+    # data) but NOT used for grid-loss detection — grid_frequency_hz is,
+    # see above, since that reflects the inverter's own loss of
+    # synchronization rather than voltage the CTs can still see upstream.
 
   - name: battery_current_a
     fc: 3
