@@ -1,0 +1,274 @@
+# megarevo-monitor config
+# Copy to /etc/megarevo-monitor/config.yaml and fill in.
+#
+# The `points` list below is the register map actually confirmed against a
+# real Megarevo R8KLNA + Solarman dongle (unit id 1) by live discovery —
+# none of GoodWe's published DT/LV-ET/HV-ET/HV-holding windows are
+# implemented by this inverter at all (every address in those windows came
+# back as a clean Modbus "illegal data address" exception). These addresses
+# were found by wide blind sweeps instead and cross-checked against the
+# phone app at the same moment. Re-verify against YOUR unit before trusting
+# it blindly — firmware/model revisions could differ — but this is a real
+# starting point, not a guess from a datasheet.
+#
+# Battery current/power (the app's "Battery Charging Power" / Current
+# fields) could NOT be found anywhere in an extensive sweep (0–15000+).
+# They likely only travel over the CAN bus to the BMS — the same bus the
+# original charge-limit-latch firmware bug lived on — not this RS485/
+# Solarman "meter"-style Modbus interface. Don't assume a battery power/
+# current point exists here; it doesn't, as far as this discovery went.
+
+# --- Transport: how to reach the inverter ---
+# Default/primary: poll over the LAN via the inverter's existing Solarman
+# WiFi dongle. No wiring needed — just make sure the Pi can reach the
+# dongle's IP on TCP port 8899 (same LAN/VLAN, no firewall blocking it).
+connection:
+  type: solarman
+  host: 192.168.1.50          # dongle's LAN IP — check your router's DHCP leases
+  dongle_serial: 1234567890   # LOGGER serial printed on the dongle itself,
+                               # NOT the inverter's own serial number
+  port: 8899
+  timeout: 10.0
+
+# Fallback: direct RS485 wiring into the RS485_METER port (pins 7/8), if
+# the Pi is ever physically close enough to the inverter for a cable run.
+# Comment out `connection.type: solarman` above and uncomment this instead.
+# connection:
+#   type: serial
+#   port: /dev/megarevo-rs485   # stable symlink from the udev rule, not /dev/ttyUSB0
+#   baudrate: 9600
+#   parity: "N"
+#   stopbits: 1
+#   bytesize: 8
+#   timeout: 2.0
+
+unit_id: 1   # confirm during discovery (GoodWe factory default is 247; also try 1)
+
+poll_interval_seconds: 30
+
+# --- Register map: confirmed against the real inverter (see note above) ---
+# datatype: u16 | i16 | u32 | i32 | f32
+# fc: 3 = holding register, 4 = input register
+points:
+  - name: soc_percent
+    fc: 3
+    address: 12613
+    datatype: u16
+    scale: 0.1
+    # CONFIRMED (2026-09-28), found live during a real charge/discharge
+    # cycle — this is the register that's actually SOC, not the earlier
+    # 5793 candidate (which was flat at 100% during a real discharge and
+    # is almost certainly SoH instead; kept disabled below for the record).
+    # Three independent live cross-checks against the app, all within ~1%
+    # with plausible timing skew:
+    #   950 (95.0) vs app 97%   — discharging
+    #   900 (90.0) vs app 89%   — discharging, moments earlier
+    #   910 (91.0) vs app 90%   — charging, 10s after the app reading
+    # Lives in the same battery-info cluster as battery_voltage (12606)
+    # and battery_current_a (12607) below, not near the old 5793 guess in
+    # the grid/status block — in hindsight a better place to have looked
+    # from the start.
+
+  # RETIRED (2026-09-28) — kept only as a record of what NOT to trust here.
+  # Was originally guessed as soc_percent; a real discharge test showed it
+  # pinned at 100% while the app's actual SoC dropped to 99%, meaning this
+  # is very likely SoH, not SoC. Do not re-enable as soc_percent.
+  # - name: soh_percent_unconfirmed
+  #   fc: 3
+  #   address: 5793
+  #   datatype: u16
+  #   scale: 1
+
+  - name: battery_voltage
+    fc: 3
+    address: 12606
+    datatype: u16
+    scale: 0.1
+    # Confirmed exact match to the app (56.10V) across two independent reads.
+
+  - name: grid_frequency_hz
+    fc: 3
+    address: 5792
+    datatype: u16
+    scale: 0.01
+    # Confirmed — matched the app's live drift (60.01Hz -> 59.99Hz) between
+    # reads, AND confirmed as the real "on grid" signal by a live
+    # breaker-off test (2026-09-28): dropped to 0.00 with the main breaker
+    # open. This is what grid_status in poller.py keys on now.
+
+  - name: grid_voltage
+    fc: 3
+    address: 5786
+    datatype: u16
+    scale: 0.1
+    # Confirmed exact match to the app's Grid Voltage L2 (123.70V) — but a
+    # live breaker-off test (2026-09-28) showed this stays present even
+    # with the main breaker open, so it's almost certainly reading
+    # downstream of the inverter's own EPS/output side, not the actual
+    # utility feed. Kept as telemetry (still real data) but NOT used for
+    # grid-loss detection — grid_frequency_hz is, see above.
+
+  - name: battery_current_a
+    fc: 3
+    address: 12607
+    datatype: i16
+    scale: 0.1
+    # Found live during the breaker-off discharge test (2026-09-28), in a
+    # battery-info register cluster around 12580-12660 that a prior wide
+    # sweep of 6000-15000 apparently missed or got chunk-poisoned on (see
+    # the note further up about wide reads failing when any register in
+    # the same 40-wide block is unmapped). Two independent reads ~1s apart
+    # gave -14.6A / -15.0A against the app's -13.90A at roughly the same
+    # moment (~10s skew) — negative sign and magnitude both line up given
+    # real-time current fluctuation. NOT yet cross-checked while charging
+    # (only ever seen this discharging) — verify sign convention holds
+    # once the battery is charging again.
+
+  - name: battery_power_w
+    fc: 3
+    address: 12618
+    datatype: i16
+    scale: 1
+    # Same discovery as battery_current_a above. Two reads ~1s apart gave
+    # -749W / -733W against the app's -682W at roughly the same moment —
+    # this is the field behind the original "774W charging a full
+    # battery" question; turns out it's real telemetry after all, just in
+    # a register window nobody had checked yet. Also unverified while
+    # charging — confirm sign convention (negative = discharging here)
+    # holds in both directions before trusting it for anything more than
+    # observation.
+
+  # Commented back out (2026-09-28): matched the app exactly (87.78 kWh)
+  # during discovery, but threw a real "illegal data address" Modbus
+  # exception once polled on its own by the running poller — inconsistent
+  # with a genuinely-mapped register. Possibilities: it actually needs
+  # fc=4 (input register) rather than fc=3 and discovery's fc-loop just
+  # happened to also get a response from fc=3 that wasn't really this
+  # value, or this address is only sometimes backed depending on inverter
+  # state. Re-run discover.py --start 8801 --count 1 --fc 4 (and --fc 3
+  # again) a few times before trusting it again.
+  # - name: cumulative_grid_feedin_kwh
+  #   fc: 3
+  #   address: 8801
+  #   datatype: u16
+  #   scale: 0.01
+
+  # Close but not exactly pinned yet — small drift consistent with normal
+  # timing between the register read and the app screenshot, not
+  # necessarily a wrong address. Verify a couple more times before relying
+  # on these for alerting.
+  # - name: cumulative_consumption_kwh
+  #   fc: 3
+  #   address: 8811
+  #   datatype: u16
+  #   scale: 0.01
+  #
+  # - name: cumulative_production_kwh
+  #   fc: 3
+  #   address: 8821
+  #   datatype: u16
+  #   scale: 0.01
+  #
+  # - name: pv1_voltage
+  #   fc: 3
+  #   address: 5776
+  #   datatype: u16
+  #   scale: 0.1
+  #
+  # - name: pv1_current
+  #   fc: 3
+  #   address: 5777
+  #   datatype: u16
+  #   scale: 0.1
+  #
+  # - name: pv2_voltage
+  #   fc: 3
+  #   address: 5778
+  #   datatype: u16
+  #   scale: 0.1
+  #
+  # - name: pv2_current
+  #   fc: 3
+  #   address: 5779
+  #   datatype: u16
+  #   scale: 0.1
+
+  # NOT FOUND — do not add this one. Load power wasn't located anywhere in
+  # the address space swept (0-2000, 2000-6000, 5800-5999, 6000-15000).
+  # Battery current/power WERE eventually found (see battery_current_a /
+  # battery_power_w above) — they were just in a different cluster
+  # (~12580-12660, near battery_voltage) than the earlier sweep's
+  # description implied, and a wide-chunk read of that cluster can fail
+  # entirely if any neighboring register in the same 40-wide block is
+  # unmapped (see the note on grid_voltage's window above for the same
+  # issue). Narrow/single-address reads got through fine.
+
+# --- Thresholds for passive check results submitted to Nagios ---
+thresholds:
+  soc_warning_pct: 30      # matches the SOC you'd want NUT to start a graceful shutdown at
+  soc_critical_pct: 15
+  # SOC-decline watchdog — fires WARNING if SOC sits at least
+  # discharge_decline_min_drop_pct below its most recent peak for
+  # discharge_decline_minutes straight, with no uptick. Mirrors how the
+  # CAN charge-limit-latch bug was actually diagnosed (continuous decline
+  # with no recovery), found and fixed this week (2026-09). Originally
+  # designed this way because battery power/current seemed unreachable —
+  # they were later found too (battery_current_a / battery_power_w above,
+  # 2026-09-28), so a power-based redesign is worth considering now that
+  # both SOC and power are real, confirmed telemetry. Not changed yet;
+  # SOC-trend still works fine as-is.
+  #
+  # This battery runs in BATTERY PRIORITY mode — it's kept at 100% SOC at
+  # all times from PV or grid, whichever is available. That means any
+  # sustained decline is already abnormal (not just "discharging faster
+  # than PV," the original assumption), so this doesn't need as generous a
+  # window as a standard self-consumption setup would. Tightened from the
+  # original 30min default accordingly; loosen it back up if it ever fires
+  # on normal behavior you don't consider a problem.
+  discharge_decline_minutes: 10
+  discharge_decline_min_drop_pct: 1.0
+
+# --- Nagios passive check submission ---
+nagios:
+  enabled: true
+  # Confirmed via `lsof | grep nagios.cmd` against the real install
+  # (Debian/Ubuntu nagios4 package). Other builds commonly use:
+  #   /usr/local/nagios/var/rw/nagios.cmd
+  #   /var/lib/nagios3/rw/nagios.cmd
+  #   /var/nagios/rw/nagios.cmd
+  command_file: /var/lib/nagios4/rw/nagios.cmd
+  host_name: megarevo-inverter
+  services:
+    # Restored (2026-09-28): soc_percent is confirmed for real now
+    # (address 12613 — see the points: section above), so these are live
+    # again. Also re-add the matching battery-soc / battery-soc-decline
+    # blocks in nagios/megarevo.cfg (they were fully commented out while
+    # this was disabled) before restarting the poller.
+    soc: "battery-soc"
+    grid_status: "grid-status"
+    discharge_watchdog: "battery-soc-decline"
+    battery_power: "battery-power"
+
+# --- NUT (Network UPS Tools) integration ---
+# Writes /var/lib/megarevo-monitor/nut-dummy.dev each poll cycle — a NUT
+# dummy-ups "dummy mode" data file (plain upsc-style `variable: value`
+# lines) that the dummy-ups driver reloads whenever its mtime changes.
+# This is what lets NUT coordinate a graceful shutdown across other hosts
+# when the battery gets low, without writing a custom NUT driver — see
+# nut/ in this repo for the driver/server/client config that reads it.
+#
+# battery_charge_low: the SOC% at which ups.status includes "LB" (low
+# battery), which is what upsmon on client hosts actually watches for to
+# trigger a shutdown. Set well above the inverter's own DoD/off-grid
+# cutoff — e.g. with a 15% cutoff, 25% leaves ~10 percentage points of
+# margin. Work out your own runway from your battery's usable capacity
+# (Wh) and your actual steady load (W): (threshold% - DoD floor%) x
+# capacity(Wh) / load(W) = minutes of runway. Re-time an actual full
+# shutdown of your target hosts under real load and revisit this number
+# if it doesn't leave a clear margin over your worst-case shutdown time —
+# especially if any of those hosts draws meaningfully more than the rest
+# (see nut/ for an example of shedding a high-draw or non-essential host
+# early on a timer, independent of this threshold).
+nut:
+  enabled: true
+  battery_charge_low: 25

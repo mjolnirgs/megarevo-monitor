@@ -1,0 +1,32 @@
+# /etc/nut/upsd.users on the NUT server host.
+#
+# Two accounts:
+#   - "primary": used by upsmon running locally on this same host (see
+#     nut/upsmon-primary.conf). NUT's architecture wants exactly one
+#     PRIMARY monitor per UPS — it's the one that would eventually issue
+#     the final shutdown command to the UPS driver once every secondary
+#     has confirmed its own shutdown. There's no real hardware here for
+#     it to command off, so this host's own SHUTDOWNCMD is a harmless
+#     no-op (logs only) — it exists to satisfy NUT's design, not to shut
+#     this host down. Keeping the poller and Nagios themselves up
+#     throughout an outage is the whole point.
+#   - "secondary": shared by all your remote hosts' upsmon instances.
+#     They only need read access to status, not control, so one shared
+#     account is fine — split into per-host accounts later if you want
+#     per-host audit trails.
+#
+# CHANGE both passwords below before deploying. Use the same values in
+# the matching upsmon.conf files (MONITOR line's password field).
+#
+# NUT >= 2.8 uses "upsmon primary"/"upsmon secondary" as shown below;
+# older packaged versions (check `man upsd.users` on this install) use
+# "upsmon master"/"upsmon slave" instead — same meaning, different
+# keyword, adjust if `upsd` rejects this file on start.
+
+[primary]
+    password = CHANGE_ME_PRIMARY_PASSWORD
+    upsmon primary
+
+[secondary]
+    password = CHANGE_ME_SECONDARY_PASSWORD
+    upsmon secondary

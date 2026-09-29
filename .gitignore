@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Runtime state/logs — never belong in the repo, and config.yaml is
+# personal (real IPs/serials/passwords) — only config.example.yaml ships.
+config.yaml
+state.json
+*.dev
+discover/
+*.log
+
+.DS_Store

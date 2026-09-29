@@ -1,0 +1,49 @@
+[Unit]
+Description=Megarevo R8KLNA Modbus poller (Solarman WiFi dongle by default, RS485 fallback)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=megarevo
+Group=megarevo
+# Only needed if connection.type is "serial" (RS485 fallback) in
+# config.yaml — harmless to leave in place when using the default
+# solarman/WiFi-dongle transport, which needs no device group at all.
+SupplementaryGroups=dialout
+ExecStart=/var/lib/megarevo-monitor/venv/bin/python /opt/megarevo-monitor/poller.py
+Restart=on-failure
+RestartSec=15
+
+Environment=MEGAREVO_VAR_DIR=/var/lib/megarevo-monitor
+Environment=MEGAREVO_LOG_DIR=/var/log/megarevo-monitor
+Environment=MEGAREVO_CONFIG=/etc/megarevo-monitor/config.yaml
+
+# --- Hardening ---
+# The whole filesystem is read-only to this unit except the paths below.
+# The two SSD-backed dirs are the poller's own state/logs; the Nagios
+# command-pipe directory is added so passive check submission (nagios.
+# enabled: true) can actually write to it — ProtectSystem=strict blocks
+# that write with EROFS otherwise, even if the megarevo user is in the
+# right Unix group to pass the plain permission check.
+#
+# Path below is for Debian/Ubuntu's nagios4 package (pipe group-owned by
+# www-data, per `ls -l /var/lib/nagios4/rw/nagios.cmd`). Adjust if your
+# build differs (common alternates: /usr/local/nagios/var/rw,
+# /var/nagios/rw).
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/megarevo-monitor /var/log/megarevo-monitor /var/lib/nagios4/rw
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Needs raw device access for the RS485 adapter; DeviceAllow is set via
+# the udev tag below rather than broad device namespace access.
+
+[Install]
+WantedBy=multi-user.target

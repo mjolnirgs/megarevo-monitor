@@ -1,0 +1,17 @@
+# Pinned exactly, not a range: pymodbus renamed the client's unit-id kwarg
+# (slave -> device_id, and made it keyword-only) somewhere in its 3.x line.
+# A loose range here would silently install whichever the resolver picks,
+# and the code below is written against 3.15.0's confirmed signature.
+# Verified by hand against the installed package before committing this
+# pin — see the session notes if this ever needs bumping.
+pymodbus==3.15.0
+pyserial>=3.5
+PyYAML>=6.0
+
+# Pinned exactly, same discipline as pymodbus above: verified directly
+# against 3.0.6's installed source (not docs) — PySolarmanV5(address, serial,
+# **kwargs) with port=8899, mb_slave_id=<unit>, socket_timeout=<seconds>,
+# auto_reconnect=False; read_holding_registers(addr, qty) and
+# read_input_registers(addr, qty); disconnect(). A loose range could
+# silently pick up a signature change the same way pymodbus did.
+pysolarmanv5==3.0.6

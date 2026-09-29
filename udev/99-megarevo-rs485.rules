@@ -1,0 +1,16 @@
+# Stable device name for the USB-RS485 adapter wired to the Megarevo's
+# RS485_METER port, so it doesn't shift between /dev/ttyUSB0 and
+# /dev/ttyUSB1 depending on enumeration order (matters on a Pi already
+# running other USB peripherals, e.g. the SSD this repo's data lives on).
+#
+# ASSUMPTION: adapter uses an FTDI FT232 chip (idVendor 0403), matching
+# the commonly-sold "USB RS485 Converter Cable ... FT232RNL" adapters
+# referenced in the DIY Solar Forum threads for this exact inverter.
+#
+# VERIFY before relying on this: plug the adapter in, then run
+#   udevadm info -a -n /dev/ttyUSB0
+# (substitute whatever it enumerated as) and confirm idVendor/idProduct
+# match below. If you're using a CH340 or CP210x adapter instead, the
+# idVendor will differ (CH340: 1a86, CP210x: 10c4) — edit accordingly.
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="megarevo-rs485", GROUP="dialout", MODE="0660"
