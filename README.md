@@ -1,21 +1,19 @@
 # megarevo-monitor
 
 Modbus poller for the Megarevo R8KLNA, feeding passive checks into an
-existing Nagios Core install. Built to run on the Nagios Pi (PoE, on
-Load1), with all state/logs/venv confined to the USB SSD mounted at `/var`
+existing Nagios Core install. Built to run on a Nagios Pi (PoE, on
+Load1), with all state/logs/venv confined to a USB SSD mounted at `/var`
 so the SD card sees minimal writes.
 
 Polls over the **existing Solarman WiFi dongle** on your LAN by default —
-no wiring needed. The Nagios Pi isn't physically close enough to the
-inverter for an RS485 cable run to the RS485_METER port, but the site's
-network gear (including whatever this Pi's WiFi/switch is on) is on Load1
+no wiring needed. The site's network gear is on the inverter Load1
 backup power, and the dongle is already reachable over the LAN. A direct
 RS485 wiring path is still supported as a documented fallback in case a
 wired link ever makes sense (e.g. a future Pi placed near the inverter).
 
 ## Why "discover" comes before "poll"
 
-The forum thread confirmed the inverter speaks GoodWe's "EMS protocol"
+Forum threads confirmed the inverter speaks GoodWe's "EMS protocol"
 over Modbus — but GoodWe has shipped at least three incompatible register
 layouts across its product history (legacy DT ~768, LV-ET input registers
 ~3000, HV-ET registers ~35000/37000+). Nobody has published which one
@@ -26,6 +24,9 @@ you cross-check by eye against the phone app, and only confirmed points go
 into `poller.py`'s config. This applies the same whether you're reading
 over the WiFi dongle or RS485 — the transport changes, the register map
 still has to be earned.
+
+The register readouts are obtuse so I used claude heavilly here to decipher
+them and locate the ones I needed by pasting the output of discover.py 
 
 ## Layout
 
@@ -108,9 +109,7 @@ moment* (SOC, battery voltage, PV power, grid power, load power are the
 easiest to eyeball-match). Note down which `(unit, fc, address)` triple
 corresponds to which real quantity.
 
-Do **not** skip this step and hand-copy a register map from a GoodWe PDF —
-that's exactly the kind of unverified trust that cost a full day on the CAN
-bug earlier in this project.
+Do **not** skip this step and hand-copy a register map from a GoodWe PDF
 
 ### RS485 fallback
 
@@ -161,19 +160,16 @@ directly to your Nagios command pipe.
 See `nagios/megarevo.cfg` for a host + service template. It uses
 **passive-only** checks with `check_freshness 1` — if the poller dies or
 the link to the dongle (or RS485 adapter) drops, Nagios itself flags
-staleness instead of silently holding a last-known-good value forever (the
-exact failure shape you spent a day chasing on the inverter side).
+staleness instead of silently holding a last-known-good value forever 
 
 Confirm your Nagios command-file path (commonly
 `/usr/local/nagios/var/rw/nagios.cmd`) and set it in
-`nagios.command_file` in config.yaml — it varies by how Nagios was built,
-and any future Hermes/NUT bridge will eventually want the same path, so
-worth confirming once.
+`nagios.command_file` in config.yaml — it varies by how Nagios was built.
 
 ## Checks included
 
 - `battery-soc` — WARNING/CRITICAL on low SOC. `soc_percent` is confirmed at address 12613 (scale 0.1) on the author's own R8KLNA, found during a real charge/discharge cycle and cross-checked against the app three separate times within ~1%. An earlier guess at address 5793 stayed pinned at 100% during a real discharge (the app's SoC dropped to 99%) and is retired as likely SoH, not SoC. **Verify against your own unit before trusting this address blindly** — see the note at the top of `config.example.yaml`.
-- `grid-status` — CRITICAL if grid is lost (this is your "on battery" signal for NUT/shutdown automation downstream). Keyed on `grid_frequency_hz`, not `grid_voltage` — a live breaker-off test found `grid_voltage` stays present even with the main breaker open (it reads the inverter's own EPS/output side, not the utility feed), while `grid_frequency_hz` correctly drops to 0.
+- `grid-status` — CRITICAL if grid is lost (this is your "on battery" signal for NUT/shutdown automation downstream). Keyed on `grid_frequency_hz`, not `grid_voltage` — a live breaker-off test found `grid_voltage` stays present with the inverter breaker open (it reads the utility feed from the CT sensors), while `grid_frequency_hz` correctly drops to 0.
 - `battery-soc-decline` — WARNING if SOC has sat below its most recent peak, with no recovery, for N minutes straight. Originally designed as a battery-power-vs-PV comparison; battery current/power seemed unreachable at first, so it fell back to watching SOC trend, which is actually closer to how the CAN charge-limit-latch bug was diagnosed in the first place ("SOC kept dropping, wouldn't recover without a power cycle"). Battery current/power were later found too (`battery_current_a`/`battery_power_w`, address 12607/12618) — a power-based redesign is worth considering now that both are real, confirmed telemetry, but SOC-trend still works and hasn't been changed.
 - `battery-power` — informational only, no thresholds yet (no established baseline for what's abnormal). Reports live current/power/voltage with perfdata for graphing.
 - `comms-freshness` — handled by Nagios' own `check_freshness`, not a poller-side check
