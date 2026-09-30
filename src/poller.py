@@ -67,20 +67,48 @@ def decode_point(regs: list[int], datatype: str, scale: float) -> float | int | 
     return val * scale
 
 
-def read_point(transport, point: dict[str, Any]) -> float | int | None:
+def read_point(
+    transport,
+    point: dict[str, Any],
+    retries: int = 1,
+    retry_delay: float = 0.3,
+) -> float | int | None:
+    """Read one point, retrying up to `retries` times on the same
+    already-open connection before giving up for this cycle.
+
+    Added (2026-09-30) after journalctl analysis on real deployment logs
+    showed read failures were heavily concentrated on whichever point is
+    read FIRST in a cycle (soc_percent, first in points: order) and, to a
+    lesser extent, second (battery_voltage) — roughly a 28%/11% failure
+    rate for those two vs. ~1-2% for everything read after them in the
+    same cycle. Process restarts were ruled out (11 in 2 days, not a
+    crash loop) — this tracks position within a cycle, not which
+    register. The poller opens a fresh TCP connection to the dongle every
+    cycle (deliberately — see the note in run() about outliving a dead
+    connection), and the dongle's Modbus-over-Solarman stack apparently
+    isn't always ready to answer the first request or two right after
+    that new connection, then answers reliably for the rest of the same
+    cycle. A short retry on the same connection (not a reconnect) is
+    exactly what the data supports fixing this with.
+    """
     count = 2 if point["datatype"] in ("u32", "i32", "f32") else 1
     fc = point["fc"]
-    try:
-        if fc == 3:
-            regs = transport.read_holding_registers(point["address"], count)
-        elif fc == 4:
-            regs = transport.read_input_registers(point["address"], count)
-        else:
-            raise ValueError(f"unsupported fc {fc} for point {point['name']}")
-    except ModbusTransportError as e:
-        log.warning("Read failed for %s: %s", point["name"], e)
-        return None
-    return decode_point(regs, point["datatype"], point.get("scale", 1))
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            if fc == 3:
+                regs = transport.read_holding_registers(point["address"], count)
+            elif fc == 4:
+                regs = transport.read_input_registers(point["address"], count)
+            else:
+                raise ValueError(f"unsupported fc {fc} for point {point['name']}")
+            return decode_point(regs, point["datatype"], point.get("scale", 1))
+        except ModbusTransportError as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(retry_delay)
+    log.warning("Read failed for %s after %d attempt(s): %s", point["name"], retries + 1, last_err)
+    return None
 
 
 def submit_passive_check(command_file: str, host_name: str, service: str, status: int, message: str) -> None:
@@ -269,6 +297,9 @@ def run() -> int:
     nut_cfg = cfg.get("nut", {})
     nut_enabled = nut_cfg.get("enabled", False)
     nut_battery_charge_low = nut_cfg.get("battery_charge_low", 25)
+    conn_cfg = cfg.get("connection", {})
+    read_retries = conn_cfg.get("read_retries", 1)
+    read_retry_delay_s = conn_cfg.get("read_retry_delay_s", 0.3)
 
     watchdog = DischargeWatchdog(
         thresholds.get("discharge_decline_minutes", 30),
@@ -279,7 +310,7 @@ def run() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    conn_type = cfg.get("connection", {}).get("type", "?")
+    conn_type = conn_cfg.get("type", "?")
     log.info("Starting poller: connection=%s interval=%ss points=%s", conn_type, interval, [p["name"] for p in points])
 
     # During discovery, one run against the real dongle went completely
@@ -307,7 +338,7 @@ def run() -> int:
 
         readings: dict[str, Any] = {}
         for point in points:
-            readings[point["name"]] = read_point(transport, point)
+            readings[point["name"]] = read_point(transport, point, read_retries, read_retry_delay_s)
 
         if not hold_connection_open:
             transport.close()

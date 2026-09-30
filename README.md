@@ -155,6 +155,14 @@ It polls on `poll_interval_seconds` (default 30s), writes
 `nagios.enabled: true` in the config — submits passive check results
 directly to your Nagios command pipe.
 
+The poller reconnects fresh every cycle rather than holding one
+persistent socket open (so it self-heals from a dead connection instead
+of getting stuck on one until restarted), and on real deployments some
+dongles need a moment to settle right after that reconnect — a failed
+read is retried once automatically on the same connection
+(`connection.read_retries`/`read_retry_delay_s` in config.yaml) before
+being logged as a genuine miss for that cycle.
+
 ## Step 5 — wire into Nagios
 
 See `nagios/megarevo.cfg` for a host + service template. It uses

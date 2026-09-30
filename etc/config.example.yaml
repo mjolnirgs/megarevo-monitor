@@ -12,11 +12,11 @@
 # starting point, not a guess from a datasheet.
 #
 # Battery current/power (the app's "Battery Charging Power" / Current
-# fields) could NOT be found anywhere in an extensive sweep (0–15000+).
-# They likely only travel over the CAN bus to the BMS — the same bus the
-# original charge-limit-latch firmware bug lived on — not this RS485/
-# Solarman "meter"-style Modbus interface. Don't assume a battery power/
-# current point exists here; it doesn't, as far as this discovery went.
+# fields) were NOT found in the initial wide sweep (0-15000+), but WERE
+# later found live during a real discharge test (see battery_current_a /
+# battery_power_w below) — they were just in a different register cluster
+# (~12580-12660, alongside battery_voltage/soc_percent) than the earlier
+# sweep's chunked reads apparently covered cleanly.
 
 # --- Transport: how to reach the inverter ---
 # Default/primary: poll over the LAN via the inverter's existing Solarman
@@ -29,6 +29,23 @@ connection:
                                # NOT the inverter's own serial number
   port: 8899
   timeout: 10.0
+  # Retry a failed register read this many times, on the SAME already-open
+  # connection, before giving up for that cycle (0 disables retrying).
+  # On a real deployment, journalctl analysis showed read failures were
+  # heavily concentrated on whichever point is listed FIRST in points:
+  # below (~28% failure rate) and, less severely, second (~11%), dropping
+  # to ~1-2% for everything read after them in the same cycle — not tied
+  # to which register, since points read later that ARE in the same
+  # register cluster (e.g. battery_current_a/battery_power_w, right next
+  # to battery_voltage/soc_percent) show the same low background rate as
+  # everything else. That shape points at the connection needing a moment
+  # to settle right after each fresh per-cycle reconnect (this poller
+  # deliberately opens a new connection every cycle — see the note in
+  # run() about outliving a dead connection), not at any specific address
+  # being unreliable. A short retry on the same connection (not a
+  # reconnect) is what the data supports.
+  read_retries: 1
+  read_retry_delay_s: 0.3
 
 # Fallback: direct RS485 wiring into the RS485_METER port (pins 7/8), if
 # the Pi is ever physically close enough to the inverter for a cable run.
