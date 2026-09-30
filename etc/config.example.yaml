@@ -236,6 +236,17 @@ thresholds:
   discharge_decline_minutes: 10
   discharge_decline_min_drop_pct: 1.0
 
+  # Grid-loss confirmation window — grid_status (and the NUT dummy-ups
+  # "OB" flag) only flip to "on battery" after grid_frequency_hz has shown
+  # no reference for this many seconds straight, not on a single
+  # instantaneous reading. A single noisy/missed Modbus read on
+  # grid_frequency_hz can otherwise produce a real "on battery" false
+  # alarm with nothing actually wrong. 60s comfortably absorbs that while
+  # still being trivial next to a typical NUT shutdown runway; raise it
+  # further if false alarms persist, or lower it if you'd rather catch a
+  # genuinely brief real outage sooner and can tolerate more noise.
+  grid_loss_confirm_seconds: 60
+
 # --- Nagios passive check submission ---
 nagios:
   enabled: true

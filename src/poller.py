@@ -95,7 +95,7 @@ def submit_passive_check(command_file: str, host_name: str, service: str, status
         log.error("Could not write to Nagios command file %s: %s", command_file, e)
 
 
-def write_nut_dummy_file(readings: dict[str, Any], battery_charge_low: float) -> None:
+def write_nut_dummy_file(readings: dict[str, Any], battery_charge_low: float, on_grid_confirmed: bool) -> None:
     """Write a NUT dummy-ups "dummy mode" data file: plain upsc-style
     `variable: value` lines, one per line. The dummy-ups driver watches
     this file's mtime and reloads whenever it changes — this is what lets
@@ -103,17 +103,23 @@ def write_nut_dummy_file(readings: dict[str, Any], battery_charge_low: float) ->
     talking to upsd, without writing a custom NUT driver.
 
     ups.status carries the two flags upsmon actually acts on: "OB" (on
-    battery — grid_frequency_hz has no reference) and "LB" (low battery —
-    soc_percent at or below battery_charge_low). upsmon triggers FSD
-    (forced shutdown) on clients when it sees "OB LB" together, which is
-    the whole point of this file.
+    battery — grid_frequency_hz has no confirmed reference, see
+    GridLossWatchdog) and "LB" (low battery — soc_percent at or below
+    battery_charge_low). upsmon triggers FSD (forced shutdown) on clients
+    when it sees "OB LB" together, which is the whole point of this file.
+
+    on_grid_confirmed is the debounced signal from GridLossWatchdog, not a
+    raw instantaneous grid_frequency_hz reading — the same brief false
+    dropouts that caused spurious Nagios grid-status alerts would
+    otherwise just as easily flip this to "OB" too (and, on a host set up
+    to shed early on an on-battery timer, schedule a shutdown over a
+    reading that was never a real outage).
     """
     soc = readings.get("soc_percent")
     batt_v = readings.get("battery_voltage")
     batt_w = readings.get("battery_power_w")
-    grid_hz = readings.get("grid_frequency_hz")
 
-    on_grid = grid_hz is not None and grid_hz > 40
+    on_grid = on_grid_confirmed
     low_batt = soc is not None and soc <= battery_charge_low
 
     if on_grid:
@@ -194,6 +200,46 @@ class DischargeWatchdog:
         return False, 0.0
 
 
+class GridLossWatchdog:
+    """Confirms grid loss only after `confirm_seconds` of continuous
+    no-reference readings, instead of flipping to CRITICAL/"on battery" on
+    a single noisy poll cycle.
+
+    Found necessary in practice: grid-status and the NUT dummy-ups status
+    both keyed directly off an instantaneous `grid_frequency_hz > 40`
+    check, which produced a real "on battery" false alarm roughly twice a
+    day with a perfectly healthy grid connection — almost certainly a
+    single bad/missed Modbus read (or one genuinely noisy register value)
+    rather than an actual sub-second outage, since the battery has ample
+    runway and there was never a corresponding real event. A missing
+    reading (None, e.g. a failed Modbus read that cycle) counts the same
+    as a low/zero reading here — both mean "no confirmed grid reference
+    this cycle" — so a transient read failure alone can't produce a false
+    confirmation either; it just extends how long the debounce window has
+    to hold before firing.
+
+    Any single good reading (grid_hz > 40) immediately resets the timer —
+    this only ever delays flagging a loss, never delays recognizing
+    recovery.
+    """
+
+    def __init__(self, confirm_seconds: float = 60):
+        self.confirm_s = confirm_seconds
+        self._off_since: float | None = None
+
+    def update(self, grid_hz: float | None) -> tuple[bool, float]:
+        """Returns (on_grid_confirmed, seconds_since_last_confirmed_on)."""
+        now = time.time()
+        if grid_hz is not None and grid_hz > 40:
+            self._off_since = None
+            return True, 0.0
+
+        if self._off_since is None:
+            self._off_since = now
+        elapsed = now - self._off_since
+        return elapsed < self.confirm_s, elapsed
+
+
 def run() -> int:
     ensure_dirs()
     cfg = load_config()
@@ -218,6 +264,7 @@ def run() -> int:
         thresholds.get("discharge_decline_minutes", 30),
         thresholds.get("discharge_decline_min_drop_pct", 1.0),
     )
+    grid_watchdog = GridLossWatchdog(thresholds.get("grid_loss_confirm_seconds", 60))
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -263,8 +310,12 @@ def run() -> int:
         atomic_write_json(STATE_FILE, state)
         log.debug("Wrote state: %s", readings)
 
+        grid_configured = "grid_frequency_hz" in readings
+        grid_hz = readings.get("grid_frequency_hz")
+        on_grid_confirmed, off_elapsed = grid_watchdog.update(grid_hz)
+
         if nut_enabled:
-            write_nut_dummy_file(readings, nut_battery_charge_low)
+            write_nut_dummy_file(readings, nut_battery_charge_low, on_grid_confirmed)
 
         if nagios_enabled:
             host_name = nagios_cfg["host_name"]
@@ -283,17 +334,30 @@ def run() -> int:
                     submit_passive_check(command_file, host_name, services["soc"], status, msg)
 
             # Keyed on frequency, not voltage. Confirmed live (2026-09-28,
-            # breaker-off test): grid_voltage stayed present with the main
-            # breaker off and the inverter running the house off battery —
-            # it's reading downstream of the inverter's own EPS/output
-            # side, not the actual utility feed, so it never reflects a
-            # real outage. grid_frequency_hz dropped to 0 in the same test
-            # (no utility waveform to lock to), which is the real signal.
-            grid_hz = readings.get("grid_frequency_hz")
-            if grid_hz is not None:
-                on_grid = grid_hz > 40  # utility is ~60Hz; 0 means no reference at all
-                status = 0 if on_grid else 2
-                msg = "OK: grid present" if on_grid else f"CRITICAL: grid frequency {grid_hz:.2f}Hz — on battery"
+            # breaker-off test): grid_voltage stayed present (~120V) with
+            # the inverter's own breaker open, because this inverter senses
+            # grid voltage via CT sensors at the service entry — upstream
+            # of the inverter's breaker in the panel chain (inverter <->
+            # inverter breaker/sub-panel <-> main building panel/breaker
+            # <-> utility grid) — so it never reflects a real outage there.
+            # grid_frequency_hz dropped to 0 in the same test (the
+            # inverter's own loss of synchronization), which is the real
+            # signal.
+            #
+            # Debounced through GridLossWatchdog (confirm window:
+            # thresholds.grid_loss_confirm_seconds, default 60s) rather
+            # than reacting to a single instantaneous reading — an
+            # unconfirmed noisy/missed reading was producing a real "on
+            # battery" false alarm about twice a day with nothing actually
+            # wrong. `submit_passive_check` still fires every cycle so
+            # Nagios sees a fresh OK during that debounce window, not a
+            # freshness gap.
+            if grid_configured:
+                status = 0 if on_grid_confirmed else 2
+                if on_grid_confirmed:
+                    msg = "OK: grid present"
+                else:
+                    msg = f"CRITICAL: no confirmed grid reference for {off_elapsed:.0f}s (last grid_frequency_hz={grid_hz})"
                 if "grid_status" in services:
                     submit_passive_check(command_file, host_name, services["grid_status"], status, msg)
 
