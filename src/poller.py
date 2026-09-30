@@ -177,12 +177,22 @@ class DischargeWatchdog:
         self._decline_since: float | None = None
 
     def update(self, soc_percent: float | None) -> tuple[bool, float]:
-        if soc_percent is None:
-            self._peak_soc = None
-            self._decline_since = None
-            return False, 0.0
-
         now = time.time()
+        if soc_percent is None:
+            # A transient missing reading (e.g. Solarman dongle read
+            # contention) must NOT reset in-progress decline tracking —
+            # only a real uptick (a genuine recovery) should clear it.
+            # Previously this wiped _peak_soc/_decline_since on every null,
+            # which meant an intermittently-null poll happening more than
+            # once inside the decline window could prevent the watchdog
+            # from ever firing at all, no matter how long a real decline
+            # actually ran for. Just report current state without letting
+            # the gap itself advance or erase the clock.
+            if self._decline_since is None:
+                return False, 0.0
+            elapsed = now - self._decline_since
+            return elapsed >= self.threshold_s, elapsed
+
         if self._peak_soc is None or soc_percent >= self._peak_soc:
             # New high-water mark (or first reading ever) — a healthy
             # battery's SOC only goes up when charging, so any uptick
