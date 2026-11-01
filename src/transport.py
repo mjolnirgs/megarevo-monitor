@@ -21,6 +21,9 @@ class ModbusTransportError(Exception):
 
 
 class SerialTransport:
+    # No dongle on a direct RS485 link, so no power-on counter to report.
+    dongle_power_on_s = None
+
     def __init__(self, port: str, baudrate: int, parity: str, stopbits: int, bytesize: int, timeout: float, unit: int):
         from pymodbus.client import ModbusSerialClient
 
@@ -90,6 +93,33 @@ class SolarmanTransport:
         self._logger = logger
         self._verbose = verbose
         self._client = None
+        # Seconds since the Solarman dongle itself last powered up, taken
+        # from the most recent valid V5 response this connection received
+        # (None until one arrives). See _note_v5_response().
+        self.dongle_power_on_s: int | None = None
+
+    def _note_v5_response(self, frame: bytes) -> None:
+        """Every Solarman V5 response frame carries three little-endian u32
+        timing fields right after the frame-type/status bytes (offsets
+        13/17/21): total working time, POWER-ON TIME, and a clock offset.
+        Power-on time is seconds since the dongle last booted, and the
+        dongle is powered by the inverter — so a reset of this counter
+        means the dongle lost power (or rebooted itself), which is the only
+        restart evidence available when the inverter's own event log shows
+        nothing. Confirmed against real captured frames: it advances 1:1
+        with wall-clock time and resets to near zero after a dongle
+        restart. Best-effort: anything that doesn't look like a normal
+        data response (keep-alives, short/odd frames) is ignored."""
+        try:
+            if (
+                len(frame) >= 25
+                and frame[0] == 0xA5
+                and frame[3:5] == b"\x10\x15"
+                and frame[11] == 0x02
+            ):
+                self.dongle_power_on_s = int.from_bytes(frame[17:21], "little")
+        except Exception:  # noqa: BLE001 - diagnostics only, never break a read
+            pass
 
     def connect(self) -> bool:
         from pysolarmanv5 import NoSocketAvailableError, PySolarmanV5
@@ -125,6 +155,20 @@ class SolarmanTransport:
 
         try:
             self._client = PySolarmanV5(self._host, self._dongle_serial, **kwargs)
+            self.dongle_power_on_s = None
+            # Tap the raw V5 response on its way through so _note_v5_response
+            # can read the dongle's power-on counter. pysolarmanv5 has no
+            # public hook for the V5 header fields; an instance attribute
+            # shadows the method, and _send_receive_modbus_frame calls it
+            # via self, so every read passes through here unchanged.
+            orig = self._client._send_receive_v5_frame
+
+            def _tap(request_frame, _orig=orig):
+                response = _orig(request_frame)
+                self._note_v5_response(response)
+                return response
+
+            self._client._send_receive_v5_frame = _tap
             return True
         except (OSError, TimeoutError, NoSocketAvailableError) as e:
             # NoSocketAvailableError is pysolarmanv5's own exception for a

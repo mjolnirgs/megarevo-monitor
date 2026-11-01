@@ -263,6 +263,15 @@ thresholds:
   # further if false alarms persist, or lower it if you'd rather catch a
   # genuinely brief real outage sooner and can tolerate more noise.
   grid_loss_confirm_seconds: 60
+  # Solarman connections only: the dongle-uptime check stays WARNING while
+  # the dongle's own power-on counter is below this, i.e. for this long
+  # after any dongle restart. The dongle is powered by the inverter, and
+  # on a real deployment the inverter dropped its backup output for ~60s
+  # with grid present, battery full and NOTHING in its own event log — a
+  # reset dongle counter is the only trace such an event leaves. (Every
+  # restart is also logged by the poller and recorded in state.json under
+  # "dongle", whether or not Nagios is enabled.)
+  dongle_restart_warn_minutes: 60
 
 # --- Nagios passive check submission ---
 nagios:
@@ -284,6 +293,10 @@ nagios:
     grid_status: "grid-status"
     discharge_watchdog: "battery-soc-decline"
     battery_power: "battery-power"
+    # Solarman only — also add the matching dongle-uptime block from
+    # nagios/megarevo.cfg, or Nagios will log every result as being for an
+    # unknown service.
+    dongle_uptime: "dongle-uptime"
 
 # --- NUT (Network UPS Tools) integration ---
 # Writes /var/lib/megarevo-monitor/nut-dummy.dev each poll cycle — a NUT

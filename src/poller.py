@@ -15,6 +15,7 @@ against the real display.
 """
 from __future__ import annotations
 
+import json
 import signal
 import struct
 import sys
@@ -278,6 +279,76 @@ class GridLossWatchdog:
         return elapsed < self.confirm_s, elapsed
 
 
+class DongleRestartTracker:
+    """Detects Solarman dongle restarts from its power-on counter (see
+    SolarmanTransport._note_v5_response). The dongle is powered by the
+    inverter, so a reset that lines up with a backup-output outage is
+    evidence the inverter's own supply went down too, rather than just its
+    output relay opening — useful when the inverter's event log records
+    nothing at all.
+
+    Deliberately clock-free: the monitoring host may itself have just
+    rebooted (it can sit on the same backup output) with its clock not yet
+    NTP-synced, so wall-clock arithmetic is unreliable exactly when this
+    matters most. Within a process it compares against time.monotonic();
+    across poller restarts it only trusts "the counter went backwards"
+    (a value lower than the last one saved in state.json can only mean a
+    reset)."""
+
+    def __init__(self, last_saved_power_on_s: int | None, tolerance_s: float = 120):
+        self.tol = tolerance_s
+        self._saved = last_saved_power_on_s
+        self._last_pon: int | None = None
+        self._last_mono: float | None = None
+        self.last_restart_detected: str | None = None
+
+    def update(self, power_on_s: int | None) -> bool:
+        """Returns True on the cycle a restart is first detected."""
+        if power_on_s is None:
+            return False
+        now_mono = time.monotonic()
+        restarted = False
+        if self._last_pon is None:
+            # First reading in this process: only the backwards check is safe.
+            if self._saved is not None and power_on_s + self.tol < self._saved:
+                restarted = True
+                prev = self._saved
+        else:
+            expected = self._last_pon + (now_mono - self._last_mono)
+            if power_on_s + self.tol < expected:
+                restarted = True
+                prev = self._last_pon
+        if restarted:
+            self.last_restart_detected = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            log.warning(
+                "Solarman dongle restarted: power-on counter reset from %ds to %ds "
+                "(it came back up about %s ago). The dongle is powered by the inverter — "
+                "if the backup output also dropped, the inverter's own supply went down.",
+                prev, power_on_s, _fmt_duration(power_on_s),
+            )
+        self._last_pon, self._last_mono = power_on_s, now_mono
+        return restarted
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m {s}s"
+
+
+def _load_previous_state() -> dict[str, Any]:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
 def run() -> int:
     ensure_dirs()
     cfg = load_config()
@@ -306,6 +377,10 @@ def run() -> int:
         thresholds.get("discharge_decline_min_drop_pct", 1.0),
     )
     grid_watchdog = GridLossWatchdog(thresholds.get("grid_loss_confirm_seconds", 60))
+    prev_dongle = _load_previous_state().get("dongle") or {}
+    dongle_tracker = DongleRestartTracker(prev_dongle.get("power_on_s"))
+    dongle_tracker.last_restart_detected = prev_dongle.get("last_restart_detected")
+    dongle_warn_s = thresholds.get("dongle_restart_warn_minutes", 60) * 60
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -340,6 +415,9 @@ def run() -> int:
         for point in points:
             readings[point["name"]] = read_point(transport, point, read_retries, read_retry_delay_s)
 
+        dongle_pon = getattr(transport, "dongle_power_on_s", None)
+        dongle_tracker.update(dongle_pon)
+
         if not hold_connection_open:
             transport.close()
 
@@ -348,6 +426,14 @@ def run() -> int:
             "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(cycle_start)),
             "readings": readings,
         }
+        if dongle_pon is not None or prev_dongle:
+            state["dongle"] = {
+                # Carry the last good value forward through a cycle with no
+                # valid frame, so the next poller start still has it.
+                "power_on_s": dongle_pon if dongle_pon is not None else prev_dongle.get("power_on_s"),
+                "last_restart_detected": dongle_tracker.last_restart_detected,
+            }
+            prev_dongle = state["dongle"]
         atomic_write_json(STATE_FILE, state)
         log.debug("Wrote state: %s", readings)
 
@@ -421,6 +507,22 @@ def run() -> int:
                     f"|power={batt_w}W;;;; current={batt_a}A;;;; voltage={batt_v}V;;;;"
                 )
                 submit_passive_check(command_file, host_name, services["battery_power"], 0, msg)
+
+            # Solarman only. WARNING while the dongle's power-on counter is
+            # under dongle_restart_warn_minutes, i.e. right after any dongle
+            # restart — which, with the inverter's own event log silent, is
+            # the only trace a backup-output outage may leave. Clears by
+            # itself once the dongle has been up long enough.
+            if "dongle_uptime" in services and dongle_pon is not None:
+                perf = f"|uptime={dongle_pon}s;{dongle_warn_s};;0;"
+                if dongle_pon < dongle_warn_s:
+                    status, msg = 1, (
+                        f"WARNING: Solarman dongle restarted {_fmt_duration(dongle_pon)} ago "
+                        f"(power-on counter reset) - check whether the inverter or backup output dropped{perf}"
+                    )
+                else:
+                    status, msg = 0, f"OK: Solarman dongle up {_fmt_duration(dongle_pon)}{perf}"
+                submit_passive_check(command_file, host_name, services["dongle_uptime"], status, msg)
 
             soc_for_watchdog = readings.get("soc_percent")
             fired, elapsed = watchdog.update(soc_for_watchdog)
