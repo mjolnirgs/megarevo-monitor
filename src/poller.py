@@ -16,8 +16,10 @@ against the real display.
 from __future__ import annotations
 
 import json
+import shutil
 import signal
 import struct
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -301,13 +303,22 @@ class DongleRestartTracker:
         self._last_pon: int | None = None
         self._last_mono: float | None = None
         self.last_restart_detected: str | None = None
+        # Uptime (seconds) the dongle had reached just before its most recent
+        # detected reboot — i.e. how long it had been up when it reset. This
+        # is what tells a routine timed self-reboot (uptime ~= the dongle's
+        # fixed cadence) apart from one forced early by something external
+        # (short uptime). run() uses it to classify; it does NOT log here, so
+        # classification + log level live in one place with the correlation.
+        self.last_reboot_uptime_s: int | None = None
 
     def update(self, power_on_s: int | None) -> bool:
-        """Returns True on the cycle a restart is first detected."""
+        """Returns True on the cycle a restart is first detected. Sets
+        last_reboot_uptime_s to the pre-reboot uptime on that cycle."""
         if power_on_s is None:
             return False
         now_mono = time.monotonic()
         restarted = False
+        prev: int | None = None
         if self._last_pon is None:
             # First reading in this process: only the backwards check is safe.
             if self._saved is not None and power_on_s + self.tol < self._saved:
@@ -320,12 +331,7 @@ class DongleRestartTracker:
                 prev = self._last_pon
         if restarted:
             self.last_restart_detected = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-            log.warning(
-                "Solarman dongle restarted: power-on counter reset from %ds to %ds "
-                "(it came back up about %s ago). The dongle is powered by the inverter — "
-                "if the backup output also dropped, the inverter's own supply went down.",
-                prev, power_on_s, _fmt_duration(power_on_s),
-            )
+            self.last_reboot_uptime_s = int(prev) if prev is not None else None
         self._last_pon, self._last_mono = power_on_s, now_mono
         return restarted
 
@@ -340,6 +346,34 @@ def _fmt_duration(seconds: float) -> str:
     if h:
         return f"{h}h {m}m"
     return f"{m}m {s}s"
+
+
+def _read_ups_status(ups: str) -> set[str]:
+    """Best-effort read of a NUT UPS's ``ups.status`` flags via the ``upsc``
+    CLI, e.g. {"OL"} on line power or {"OB"} / {"OB", "LB"} on battery.
+    Returns an empty set if ``ups`` is unset, ``upsc`` isn't installed, or the
+    read fails — correlation is a diagnostic nicety and must never raise or
+    stall the poll loop. Used to tell whether the thing that senses the
+    inverter's backup output (typically an APC on the monitoring host) was on
+    battery around the same moment the dongle rebooted: a dongle reboot that
+    lines up with a backup-output drop means the inverter itself restarted,
+    whereas a backup-output drop with NO dongle reboot means the inverter kept
+    running and only the Load1 feed opened."""
+    if not ups:
+        return set()
+    exe = shutil.which("upsc")
+    if not exe:
+        return set()
+    try:
+        res = subprocess.run(
+            [exe, ups, "ups.status"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:  # noqa: BLE001 - diagnostics only, never break a cycle
+        return set()
+    if res.returncode != 0:
+        return set()
+    return set(res.stdout.split())
 
 
 def _load_previous_state() -> dict[str, Any]:
@@ -380,7 +414,42 @@ def run() -> int:
     prev_dongle = _load_previous_state().get("dongle") or {}
     dongle_tracker = DongleRestartTracker(prev_dongle.get("power_on_s"))
     dongle_tracker.last_restart_detected = prev_dongle.get("last_restart_detected")
-    dongle_warn_s = thresholds.get("dongle_restart_warn_minutes", 60) * 60
+
+    # --- dongle health / reboot-correlation config (Solarman only) ---
+    dongle_cfg = cfg.get("dongle", {})
+    # Page only if the dongle stays UNREACHABLE (no valid response) this long.
+    # A dongle *reboot* on its own never alerts — routine Solarman self-reboots
+    # recover in under a minute, so they never trip this; a dongle or inverter
+    # that genuinely doesn't come back does.
+    dongle_down_alert_s = dongle_cfg.get("down_alert_minutes", 10) * 60
+    # The dongle's own fixed self-reboot period, if it has one (0 = unknown).
+    # A reboot whose pre-reboot uptime is within tolerance of this is "routine"
+    # (the scheduled timer fired); one that fires well EARLY is off-cadence and
+    # points at something external rebooting it.
+    dongle_cadence_s = dongle_cfg.get("reboot_cadence_minutes", 0) * 60
+    dongle_cadence_tol_s = dongle_cfg.get("reboot_cadence_tolerance_minutes", 20) * 60
+    # A NUT UPS (e.g. "apc@localhost") that senses the inverter's backup
+    # output. If set, each cycle checks whether it is on battery, so a dongle
+    # reboot can be correlated with a Load1/backup-output drop. Empty disables
+    # correlation entirely (the poll loop is unaffected either way).
+    dongle_corr_ups = (dongle_cfg.get("correlate_ups") or "").strip()
+    dongle_corr_window_s = dongle_cfg.get("correlate_window_seconds", 180)
+    # How long the dongle-uptime check latches WARNING after a correlated
+    # inverter-reboot so it's visible in Nagios, then self-clears.
+    dongle_outage_latch_s = dongle_cfg.get("outage_latch_minutes", 15) * 60
+
+    # Monotonic timestamp of the last cycle the dongle gave a valid response.
+    # Assume reachable at startup so a brief first-cycle miss can't page.
+    dongle_last_seen_mono = time.monotonic()
+    # Monotonic timestamp the correlation UPS was last seen on battery (OB).
+    dongle_last_ob_mono: float | None = None
+    # Latch + description for the most recent correlated inverter reboot.
+    dongle_outage_latch_until = 0.0
+    dongle_outage_desc = ""
+    # Classification of the most recent dongle reboot, carried in state.json:
+    # "routine" | "anomalous" | "inverter_outage".
+    dongle_last_reboot_kind = prev_dongle.get("last_reboot_kind")
+    dongle_last_reboot_load1 = prev_dongle.get("last_reboot_load1_dropped")
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -416,7 +485,64 @@ def run() -> int:
             readings[point["name"]] = read_point(transport, point, read_retries, read_retry_delay_s)
 
         dongle_pon = getattr(transport, "dongle_power_on_s", None)
-        dongle_tracker.update(dongle_pon)
+
+        # Correlation input: is the backup-output sensor (APC) on battery?
+        # Read it every cycle so a brief Load1 drop is caught even though the
+        # dongle-reboot detection that pairs with it lands a cycle or two
+        # later. Best-effort; empty/!configured -> no correlation.
+        now_mono = time.monotonic()
+        if dongle_corr_ups:
+            if "OB" in _read_ups_status(dongle_corr_ups):
+                dongle_last_ob_mono = now_mono
+
+        restarted = dongle_tracker.update(dongle_pon)
+        if restarted:
+            uptime_at_reset = dongle_tracker.last_reboot_uptime_s
+            in_cadence = (
+                dongle_cadence_s > 0
+                and uptime_at_reset is not None
+                and abs(uptime_at_reset - dongle_cadence_s) <= dongle_cadence_tol_s
+            )
+            load1_dropped = (
+                dongle_last_ob_mono is not None
+                and (now_mono - dongle_last_ob_mono) <= dongle_corr_window_s
+            )
+            up_str = _fmt_duration(uptime_at_reset) if uptime_at_reset is not None else "?"
+            if load1_dropped:
+                # Dongle reset AND the backup output dropped together =
+                # the inverter itself rebooted (its own supply died, taking
+                # the dongle down with it). This is the event worth surfacing.
+                dongle_reboot_kind = "inverter_outage"
+                dongle_outage_desc = (
+                    f"inverter reboot: Load1/backup output dropped and the dongle reset "
+                    f"after only {up_str} uptime"
+                    + (f" (off its ~{dongle_cadence_s // 60}min self-reboot cadence)" if dongle_cadence_s else "")
+                )
+                dongle_outage_latch_until = now_mono + dongle_outage_latch_s
+                log.warning("Correlated %s", dongle_outage_desc)
+            elif dongle_cadence_s > 0 and not in_cadence:
+                # Rebooted off-schedule but the backup output stayed up, so the
+                # inverter kept running — just the dongle glitching. Noted, not
+                # alerted.
+                dongle_reboot_kind = "anomalous"
+                log.info(
+                    "Off-cadence dongle reboot (uptime %s, cadence ~%dmin) but no Load1 drop "
+                    "— dongle glitch, inverter unaffected.",
+                    up_str, dongle_cadence_s // 60,
+                )
+            else:
+                dongle_reboot_kind = "routine"
+                log.info(
+                    "Routine dongle self-reboot (uptime %s) — no alert.", up_str
+                )
+            dongle_last_reboot_kind = dongle_reboot_kind
+            dongle_last_reboot_load1 = load1_dropped
+
+        # Track how long the dongle has gone without a valid response. A
+        # single missed cycle is normal; only a sustained gap is alertable.
+        if dongle_pon is not None:
+            dongle_last_seen_mono = now_mono
+        dongle_down_s = now_mono - dongle_last_seen_mono
 
         if not hold_connection_open:
             transport.close()
@@ -432,6 +558,13 @@ def run() -> int:
                 # valid frame, so the next poller start still has it.
                 "power_on_s": dongle_pon if dongle_pon is not None else prev_dongle.get("power_on_s"),
                 "last_restart_detected": dongle_tracker.last_restart_detected,
+                # Classification of that last reboot, for at-a-glance triage:
+                #   routine         - the dongle's own timed self-reboot
+                #   anomalous       - off-cadence, but backup output stayed up
+                #   inverter_outage - off-cadence AND Load1/backup output dropped
+                "last_reboot_uptime_s": dongle_tracker.last_reboot_uptime_s,
+                "last_reboot_kind": dongle_last_reboot_kind,
+                "last_reboot_load1_dropped": dongle_last_reboot_load1,
             }
             prev_dongle = state["dongle"]
         atomic_write_json(STATE_FILE, state)
@@ -508,20 +641,39 @@ def run() -> int:
                 )
                 submit_passive_check(command_file, host_name, services["battery_power"], 0, msg)
 
-            # Solarman only. WARNING while the dongle's power-on counter is
-            # under dongle_restart_warn_minutes, i.e. right after any dongle
-            # restart — which, with the inverter's own event log silent, is
-            # the only trace a backup-output outage may leave. Clears by
-            # itself once the dongle has been up long enough.
-            if "dongle_uptime" in services and dongle_pon is not None:
-                perf = f"|uptime={dongle_pon}s;{dongle_warn_s};;0;"
-                if dongle_pon < dongle_warn_s:
+            # Solarman only. This check does NOT alert on a dongle reboot by
+            # itself — many Solarman loggers self-reboot on a fixed cycle
+            # (recovering in under a minute) with the inverter unaffected, so
+            # a short counter reset is routine noise. It pages only when the
+            # dongle stays UNREACHABLE (no valid response) for longer than
+            # thresholds.dongle_down_alert_minutes, which means the poller is
+            # genuinely blind — the dongle or the inverter didn't come back.
+            # A real inverter outage that drops the backup output is caught
+            # separately and immediately by the UPS sensing that output; this
+            # is just the slow backstop for "never recovered". Current uptime
+            # is still reported as perfdata so reboots remain visible on a
+            # graph without raising an alert.
+            if "dongle_uptime" in services:
+                disp_pon = dongle_pon if dongle_pon is not None else (
+                    prev_dongle.get("power_on_s") if prev_dongle else None
+                )
+                up_perf = f"uptime={disp_pon}s" if disp_pon is not None else "uptime=U"
+                perf = f"|{up_perf};;;0; down={int(dongle_down_s)}s;{dongle_down_alert_s};;0;"
+                if dongle_down_s > dongle_down_alert_s:
+                    # Backstop: the dongle genuinely isn't answering.
                     status, msg = 1, (
-                        f"WARNING: Solarman dongle restarted {_fmt_duration(dongle_pon)} ago "
-                        f"(power-on counter reset) - check whether the inverter or backup output dropped{perf}"
+                        f"WARNING: Solarman dongle unreachable for {_fmt_duration(dongle_down_s)} "
+                        f"(no valid response) - poller is blind; check the dongle and the inverter{perf}"
                     )
+                elif now_mono < dongle_outage_latch_until:
+                    # Correlated inverter reboot, latched briefly so Nagios
+                    # shows it then self-clears. The backup-output UPS alerts
+                    # instantly on its own; this corroborates the cause.
+                    status, msg = 1, f"WARNING: {dongle_outage_desc}{perf}"
+                elif disp_pon is not None:
+                    status, msg = 0, f"OK: Solarman dongle up {_fmt_duration(disp_pon)}{perf}"
                 else:
-                    status, msg = 0, f"OK: Solarman dongle up {_fmt_duration(dongle_pon)}{perf}"
+                    status, msg = 0, f"OK: Solarman dongle reachable{perf}"
                 submit_passive_check(command_file, host_name, services["dongle_uptime"], status, msg)
 
             soc_for_watchdog = readings.get("soc_percent")

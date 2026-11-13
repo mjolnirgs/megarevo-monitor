@@ -263,15 +263,42 @@ thresholds:
   # further if false alarms persist, or lower it if you'd rather catch a
   # genuinely brief real outage sooner and can tolerate more noise.
   grid_loss_confirm_seconds: 60
-  # Solarman connections only: the dongle-uptime check stays WARNING while
-  # the dongle's own power-on counter is below this, i.e. for this long
-  # after any dongle restart. The dongle is powered by the inverter, and
-  # on a real deployment the inverter dropped its backup output for ~60s
-  # with grid present, battery full and NOTHING in its own event log — a
-  # reset dongle counter is the only trace such an event leaves. (Every
-  # restart is also logged by the poller and recorded in state.json under
-  # "dongle", whether or not Nagios is enabled.)
-  dongle_restart_warn_minutes: 60
+
+# --- Solarman dongle health & reboot correlation (Solarman transport only) ---
+# A dongle *reboot* is never alerted on by itself. Many Solarman loggers
+# self-reboot on a fixed cycle (one real unit settled into a reboot every ~3h,
+# each recovering in well under a minute) with the inverter completely
+# unaffected, so reboots are routine. Every reboot is still recorded in
+# state.json under "dongle" (with a classification) and logged, whether or not
+# Nagios is enabled. The dongle-uptime Nagios check only goes WARNING for the
+# two conditions below. Omit this whole section to accept the defaults.
+dongle:
+  # Page only if the dongle stays UNREACHABLE (no valid response at all) for
+  # longer than this — i.e. it genuinely didn't come back and the poller is
+  # blind. Routine sub-minute self-reboots never trip it.
+  down_alert_minutes: 10
+
+  # The dongle's own fixed self-reboot period, if it has one, in minutes
+  # (0 = unknown/none). A reboot whose pre-reboot uptime is within
+  # reboot_cadence_tolerance_minutes of this is treated as the routine timed
+  # reboot; one that fires well early is "off-cadence" and, combined with a
+  # backup-output drop (below), flags a real inverter reboot. Set from what
+  # you actually observe in the logs — e.g. a logger rebooting every ~3h:
+  reboot_cadence_minutes: 0
+  reboot_cadence_tolerance_minutes: 20
+
+  # Correlate a dongle reboot with the inverter's backup output (Load1) by
+  # watching a NUT UPS that senses that output — typically an APC on this same
+  # host. If that UPS was on battery within correlate_window_seconds of the
+  # dongle reboot, the inverter itself rebooted (its own supply dropped, taking
+  # the dongle with it); if the dongle reboots with NO backup-output drop, the
+  # inverter kept running and it was just the dongle. Needs the `upsc` CLI on
+  # PATH. Leave correlate_ups empty to disable correlation entirely.
+  correlate_ups: ""              # e.g. "apc@localhost"
+  correlate_window_seconds: 180
+  # How long the dongle-uptime check latches WARNING after a correlated
+  # inverter reboot (so Nagios shows it), then self-clears.
+  outage_latch_minutes: 15
 
 # --- Nagios passive check submission ---
 nagios:
