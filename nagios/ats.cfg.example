@@ -1,0 +1,39 @@
+# Optional: monitor an APC Rack ATS (e.g. AP7732) that feeds your protected
+# loads from two sources — typically Source A = the inverter's backup output
+# (Load1) and Source B = utility/mains. The ATS fails over between them, so an
+# inverter reboot or output dropout no longer drops the loads; this check tells
+# you when that has happened and, more importantly, when the failover path is
+# degraded (one source gone) so the next event WOULD drop them.
+#
+# Enable SNMPv1 on the card first (Administration -> Network -> SNMPv1 ->
+# access = enabled, then access control: a read community restricted to this
+# Nagios host's IP). Old AOS firmware often needs a management-interface reboot
+# before the agent answers — that does NOT touch the transfer function.
+#
+# Verify the three OIDs on YOUR unit before trusting them (firmware differs):
+#   snmpget -v1 -c <community> -Oqv <ats-ip> .1.3.6.1.4.1.318.1.1.8.5.1.2.0  # selected source: 1=A 2=B
+#   snmpget -v1 -c <community> -Oqv <ats-ip> .1.3.6.1.4.1.318.1.1.8.5.1.3.0  # redundancy: 1=lost 2=redundant
+#   snmpwalk -v1 -c <community> -On <ats-ip> .1.3.6.1.4.1.318.1.1.8.5.3.2.1.6 # source NAMES, to confirm which is A/B
+#
+# Replace 192.0.2.11 with your ATS IP and CHANGE_ME with the read community.
+
+define command {
+    command_name  check_apc_ats
+    command_line  /usr/lib/nagios/plugins/check_apc_ats.sh $ARG1$ $ARG2$
+}
+
+define service {
+    use                     generic-service
+    host_name               megarevo-inverter
+    service_description      ats-source
+    check_command           check_apc_ats!192.0.2.11!CHANGE_ME
+    # 1-min checks, 3 attempts: a brief flip to mains during an inverter
+    # reboot (~60s) stays SOFT and clears before it pages; a sustained
+    # transfer or a lost-redundancy condition goes HARD after ~3 min.
+    check_interval          1
+    retry_interval          1
+    max_check_attempts      3
+    active_checks_enabled   1
+    passive_checks_enabled  0
+    check_freshness         0
+}

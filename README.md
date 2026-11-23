@@ -183,6 +183,31 @@ Confirm your Nagios command-file path (commonly
 - `dongle-uptime` — Solarman connections only. Every Solarman V5 reply carries the dongle's own power-on counter (seconds since it last booted), and the dongle is powered by the inverter. A dongle **reboot is never alerted on by itself** — many Solarman loggers self-reboot on a fixed cycle (one real unit settled into a reboot every ~3h, each recovering in under a minute) with the inverter completely unaffected, so reboots are routine. The check goes WARNING only for (a) the dongle staying **unreachable** longer than `dongle.down_alert_minutes` (default 10 — the poller is genuinely blind), or (b) a **correlated inverter reboot**: an off-cadence dongle reset that lines up with the inverter's backup output (Load1) dropping. Correlation watches a NUT UPS that senses that output (`dongle.correlate_ups`, e.g. an APC on the same host); a dongle reboot *with* a backup-output drop means the inverter itself restarted, while a drop with *no* dongle reboot means the inverter kept running and only the Load1 feed opened. Every reboot is still recorded in `state.json` under `dongle` (with a `routine`/`anomalous`/`inverter_outage` classification and the pre-reboot uptime) and logged, independent of Nagios. Detection is clock-free, so it still works when the monitoring host itself just rebooted on the same backup output and hasn't NTP-synced yet. Added after the inverter dropped its backup output for ~60s with grid present, battery full, and nothing at all in its own event log — a reset counter paired with the UPS's on-battery signal is the only trace that kind of event leaves.
 - `comms-freshness` — handled by Nagios' own `check_freshness`, not a poller-side check
 
+## Optional — monitoring an APC Rack ATS
+
+If you put an APC Rack ATS (e.g. AP7732) in front of your protected loads —
+Source A from the inverter's backup output (Load1), Source B from utility/mains
+— the ATS rides out inverter reboots and brief output dropouts by failing over,
+so the loads never notice. `nagios/check_apc_ats.sh` (with
+`nagios/ats.cfg.example`) then watches the ATS over SNMP and tells you:
+
+- **which source is live** — WARNING when it's running on mains (B), i.e. the
+  inverter output (A) is down right now (loads are fine, but the inverter isn't
+  supplying);
+- **whether failover is still possible** — CRITICAL when it's on the inverter (A)
+  but the mains source (B) is unavailable (`redundancy LOST`), because the next
+  inverter hiccup would then drop the loads hard. That silent degradation is the
+  real thing worth paging on, and nothing else surfaces it.
+
+It reads three scalars under the APC PowerNet ATS MIB
+(`.1.3.6.1.4.1.318.1.1.8.5.1`): selected source (`.2.0`), redundancy state
+(`.3.0`), and comm status (`.1.0`). Confirm those OIDs and which source is A/B on
+your own unit first (the example file has the `snmpget`/`snmpwalk` one-liners) —
+firmware differs, and this project's whole premise is verifying register/OID maps
+rather than trusting them. The 1-minute / 3-attempt check interval deliberately
+lets a brief reboot-driven flip to mains clear as a SOFT state before it pages,
+while a sustained transfer or lost redundancy goes HARD and notifies.
+
 ## Step 6 — graceful shutdown of other hosts on low battery (optional)
 
 Set `nut.enabled: true` in `config.yaml` and the poller will also write a
